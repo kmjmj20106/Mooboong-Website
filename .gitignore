@@ -1,0 +1,26 @@
+# Installed dependencies and generated files
+node_modules/
+__pycache__/
+*.py[cod]
+coverage/
+*.log
+.DS_Store
+._*
+
+# Local settings and credentials (keep the example configuration)
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.crt
+
+# Local member data, uploads, and backups
+/data/
+/backups/
+*.sqlite*
+*.db
+*.db-wal
+*.db-shm
+*.backup.json
