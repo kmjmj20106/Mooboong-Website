@@ -1,0 +1,30 @@
+# Repository metadata and local dependencies
+.git
+**/.git
+**/node_modules
+**/__pycache__
+**/*.py[cod]
+**/.DS_Store
+**/._*
+**/*.log
+
+# Credentials are provided by Render, not copied into the image
+**/.env
+**/.env.*
+**/secrets
+**/*.pem
+**/*.key
+**/*.crt
+
+# Runtime data is stored in Supabase
+data
+backups
+**/*.sqlite*
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.backup.json
+
+# Tests and reports are not needed in the production image
+tests
+coverage
