@@ -82,3 +82,7 @@ CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS team_members_member ON team_members(member_id);
 REVOKE ALL ON SCHEMA mooboong FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA mooboong FROM PUBLIC;
+
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS created_by TEXT REFERENCES members(id);
+CREATE INDEX IF NOT EXISTS bookings_series_id ON bookings(series_id);
+CREATE INDEX IF NOT EXISTS attachments_post_id ON attachments(post_id);

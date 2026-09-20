@@ -144,31 +144,31 @@ function send(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-async function bookingView(row, member) {
-  const now = seoulNow();
-  const upcoming = row.date > now.date || (row.date === now.date && row.start_min > now.minute && !(await getSettings(db)).blockSameDayCancellation);
+async function bookingView(row, member, context = null) {
+  const now = context?.now || seoulNow();
+  const upcoming = row.date > now.date || (row.date === now.date && row.start_min > now.minute && !(context?.settings || await getSettings(db)).blockSameDayCancellation);
   return {
     id: row.id, date: row.date, start: toTime(row.start_min), end: toTime(row.end_min), type: row.type,
-    seriesId:row.series_id, recurrenceEnd:row.recurrence_end, memberId: row.member_id, memberName: row.member_name, teamId: row.team_id, teamName: row.team_name,
-    canCancel: Boolean(member.admin || (upcoming && (row.member_id === member.id || (row.team_id && (await db.prepare('SELECT 1 FROM team_members WHERE team_id=? AND member_id=?').get(row.team_id, member.id)))))),
+    createdBy:row.created_by || row.member_id, createdByName:row.creator_name || row.member_name, seriesId:row.series_id, recurrenceEnd:row.recurrence_end, memberId: row.member_id, memberName: row.member_name, teamId: row.team_id, teamName: row.team_name,
+    canCancel: Boolean(member.admin || (upcoming && (row.member_id === member.id || (row.team_id && (context ? context.teamIds.has(row.team_id) : await db.prepare('SELECT 1 FROM team_members WHERE team_id=? AND member_id=?').get(row.team_id, member.id)))))),
   };
 }
-const bookingSelect = `SELECT b.*,m.name AS member_name,t.name AS team_name FROM bookings b
-  JOIN members m ON m.id=b.member_id LEFT JOIN teams t ON t.id=b.team_id`;
+const bookingSelect = `SELECT b.*,m.name AS member_name,t.name AS team_name,creator.name AS creator_name FROM bookings b
+  JOIN members m ON m.id=b.member_id LEFT JOIN teams t ON t.id=b.team_id
+  LEFT JOIN members creator ON creator.id=COALESCE(b.created_by,b.member_id)`;
 async function getBooking(id, member) { const row = (await db.prepare(`${bookingSelect} WHERE b.id=?`).get(id)); return row ? (await bookingView(row, member)) : null; }
 async function usageFor(memberId, week) {
   const until = addDays(week, 7);
-  return {
-    personalHours: (await db.prepare(`SELECT COALESCE(SUM(end_min-start_min),0)/60.0 AS hours FROM bookings
-      WHERE type='personal' AND member_id=? AND date>=? AND date<?`).get(memberId, week, until)).hours,
-    teams: await Promise.all((await db.prepare(`SELECT DISTINCT t.id AS teamId,t.name AS teamName FROM teams t
-      JOIN team_members tm ON tm.team_id=t.id WHERE tm.member_id=?`).all(memberId)).map(async team => ({ ...team,
-      hours: (await db.prepare(`SELECT COALESCE(SUM(end_min-start_min),0)/60.0 AS hours FROM bookings
-        WHERE type='team' AND team_id=? AND date>=? AND date<?`).get(team.teamId, week, until)).hours,
-    }))),
-  };
+  const [personal, teams] = await Promise.all([
+    db.prepare(`SELECT COALESCE(SUM(end_min-start_min),0)/60.0 AS hours FROM bookings
+      WHERE type='personal' AND member_id=? AND date>=? AND date<?`).get(memberId, week, until),
+    db.prepare(`SELECT t.id AS teamId,t.name AS teamName,COALESCE(SUM(b.end_min-b.start_min),0)/60.0 AS hours
+      FROM teams t LEFT JOIN bookings b ON b.team_id=t.id AND b.type='team' AND b.date>=? AND b.date<?
+      WHERE t.id IN (SELECT team_id FROM team_members WHERE member_id=?) GROUP BY t.id,t.name ORDER BY t.name`).all(week, until, memberId),
+  ]);
+  return {personalHours:personal.hours, teams};
 }
-async function createOneBooking(body, member, seriesId = null, recurring = false) {
+async function createOneBooking(body, member, seriesId = null, recurring = false, ownerMember = member) {
   const { date, type } = body;
   if (!validDate(date)) fail(400, '예약 날짜를 확인해 주세요.');
   if (!['personal', 'team'].includes(type)) fail(400, '개인 연습 또는 팀 합주를 선택해 주세요.');
@@ -183,11 +183,11 @@ async function createOneBooking(body, member, seriesId = null, recurring = false
     if (type === 'team') {
       teamId = Number(body.teamId);
       if (!Number.isSafeInteger(teamId) || !(await db.prepare('SELECT id FROM teams WHERE id=?').get(teamId))) fail(400, '팀을 선택해 주세요.');
-      if (!(await db.prepare('SELECT 1 FROM team_members WHERE team_id=? AND member_id=?').get(teamId, member.id))) fail(403, '소속 팀의 합주만 예약할 수 있습니다.');
+      if (!member.admin && !(await db.prepare('SELECT 1 FROM team_members WHERE team_id=? AND member_id=?').get(teamId, member.id))) fail(403, '소속 팀의 합주만 예약할 수 있습니다.');
     }
     if ((await db.prepare('SELECT id FROM bookings WHERE date=? AND start_min<? AND end_min>?').get(date, end, start))) fail(409, '다른 예약과 시간이 겹칩니다. 빈 시간을 다시 선택해 주세요.');
     const ownerColumn = type === 'team' ? 'team_id' : 'member_id';
-    const owner = teamId ?? member.id;
+    const owner = teamId ?? ownerMember.id;
     const week = sunday(date);
     const used = (await db.prepare(`SELECT COALESCE(SUM(end_min-start_min),0) AS minutes FROM bookings
       WHERE type=? AND ${ownerColumn}=? AND date>=? AND date<?`).get(type, owner, week, addDays(week, 7))).minutes;
@@ -206,13 +206,21 @@ async function createOneBooking(body, member, seriesId = null, recurring = false
       }
     }
     if (continuousEnd - continuousStart > settings.maxContinuousHours * 60) fail(400, `연속 예약은 최대 ${settings.maxContinuousHours}시간입니다. 이어지는 예약도 포함됩니다.`);
-    const id = Number((await db.prepare('INSERT INTO bookings(member_id,team_id,type,date,start_min,end_min,series_id,recurrence_end) VALUES (?,?,?,?,?,?,?,?)').run(member.id, teamId, type, date, start, end, seriesId, body.repeatUntil || null)).lastInsertRowid);
-    (await audit(db, member.id, 'booking.create', { bookingId: id }));
+    const id = Number((await db.prepare('INSERT INTO bookings(member_id,team_id,type,date,start_min,end_min,series_id,recurrence_end,created_by) VALUES (?,?,?,?,?,?,?,?,?)').run(ownerMember.id, teamId, type, date, start, end, seriesId, body.repeatUntil || null, member.id)).lastInsertRowid);
+    (await audit(db, member.id, 'booking.create', { bookingId: id, memberId: ownerMember.id, teamId }));
     return (await getBooking(id, member));
   }
 }
 async function createBooking(body,member) {
   return (await transaction(async ()=>{
+    let ownerMember = member;
+    if (body.memberId !== undefined) {
+      if (typeof body.memberId !== 'string' || !body.memberId.trim() || body.memberId.length > 100) fail(400, '예약할 멤버를 선택해 주세요.');
+      const ownerId = body.memberId.trim().normalize('NFC');
+      if (!member.admin && ownerId !== member.id) fail(403, '다른 멤버 대신 예약하는 기능은 운영진만 사용할 수 있습니다.');
+      ownerMember = await db.prepare('SELECT id FROM members WHERE id=?').get(ownerId);
+      if (!ownerMember) fail(400, '예약할 멤버를 찾을 수 없습니다.');
+    }
     const dates=[body.date];let seriesId=null;
     if(body.repeatUntil){
       if(body.type!=='team')fail(400,'매주 반복은 팀 합주에서만 사용할 수 있습니다.');
@@ -225,17 +233,17 @@ async function createBooking(body,member) {
       seriesId=randomToken();
     }
     const bookings=[];
-    for(const date of dates){try{bookings.push((await createOneBooking({...body,date},member,seriesId,Boolean(seriesId))))}catch(e){if(e.status)e.message=`${date}: ${e.message}`;throw e}}
+    for(const date of dates){try{bookings.push((await createOneBooking({...body,date},member,seriesId,Boolean(seriesId),ownerMember)))}catch(e){if(e.status)e.message=`${date}: ${e.message}`;throw e}}
     return {booking:bookings[0],bookings,count:bookings.length};
   }));
 }
 
-async function postView(row) {
+async function postView(row, attachments = null) {
   return { id: row.id, kind: row.kind, title: row.title, body: row.body, category: row.category,
     pinned: Boolean(row.pinned), authorId: row.author_id, authorName: row.author_name,
-    sourceUrl:row.source_url, hasDocument:Boolean(row.document_html), attachments:(await db.prepare('SELECT id,name,length(content) AS size FROM attachments WHERE post_id=?').all(row.id)), createdAt: row.created_at, updatedAt: row.updated_at };
+    sourceUrl:row.source_url, hasDocument:Boolean(row.has_document ?? row.document_html), attachments:attachments ?? (await db.prepare('SELECT id,name,length(content) AS size FROM attachments WHERE post_id=?').all(row.id)), createdAt: row.created_at, updatedAt: row.updated_at };
 }
-const postSelect = 'SELECT p.*,m.name AS author_name FROM posts p JOIN members m ON m.id=p.author_id';
+const postSelect = `SELECT p.id,p.kind,p.title,p.body,p.category,p.pinned,p.author_id,p.created_at,p.updated_at,p.source_url,CASE WHEN length(p.document_html)>0 THEN 1 ELSE 0 END AS has_document,m.name AS author_name FROM posts p JOIN members m ON m.id=p.author_id`;
 function validatePost(body) {
   if (!['notice', 'wiki'].includes(body.kind)) fail(400, '공지 또는 위키를 선택해 주세요.');
   if (typeof body.title !== 'string' || !body.title.trim() || body.title.length > 150) fail(400, '제목은 1~150자로 입력해 주세요.');
@@ -268,8 +276,18 @@ function parseXlsx(bytes) {
 }
 
 async function api(req, res, url) {
-  (await cleanExpired());
   const path = url.pathname; const method = req.method;
+  if (path === '/api/logout' && method === 'POST') {
+    clearSession(res);
+    const raw = readCookies(req.headers.cookie).mooboong_session;
+    if (raw && /^[A-Za-z0-9_-]{43}$/.test(raw)) {
+      const hash = tokenHash(raw);
+      await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(hash);
+      removeUploads(hash);
+    }
+    return send(res, 200, { ok: true });
+  }
+  await cleanExpired();
   if (path === '/api/status' && method === 'GET') return send(res, 200, { service:'mooboong', storage:db.dialect, setupRequired: !(await db.prepare('SELECT 1 FROM members LIMIT 1').get()), setupTokenRequired:Boolean(process.env.SETUP_TOKEN) });
   if (path === '/api/setup' && method === 'POST') {
     if ((await db.prepare('SELECT 1 FROM members LIMIT 1').get())) fail(409, '이미 초기 설정이 완료되었습니다. 로그인해 주세요.');
@@ -297,11 +315,6 @@ async function api(req, res, url) {
     attempts.delete(`id:${id}`);
     (await createSession(res, id));
     return send(res, 200, { member: (await safeMember(member)) });
-  }
-  if (path === '/api/logout' && method === 'POST') {
-    const session = (await sessionFrom(req));
-    if (session) { (await db.prepare('DELETE FROM sessions WHERE token_hash=?').run(session.hash)); removeUploads(session.hash); }
-    clearSession(res); return send(res, 200, { ok: true });
   }
   if (path === '/api/me' && method === 'GET') return send(res, 200, { member: (await safeMember((await requireMember(req, { allowPasswordChange: true })).member)) });
   if (path === '/api/password' && method === 'POST') {
@@ -347,15 +360,46 @@ async function api(req, res, url) {
     attempts.delete(`id:${operator.member.id}`);
     return send(res, 200, { ok: true, mustChangePassword: true });
   }
+  if (path === '/api/booking-options' && method === 'GET') {
+    if (!member.admin) fail(403, '운영진만 사용할 수 있습니다.');
+    return send(res, 200, { members: await db.prepare('SELECT id,name FROM members ORDER BY name,id').all() });
+  }
   if (path === '/api/teams' && method === 'GET') return send(res, 200, { teams: (await teamList()) });
   if (path === '/api/bookings' && method === 'GET') {
     const date = url.searchParams.get('week') || seoulNow().date;
     if (!validDate(date)) fail(400, '날짜를 확인해 주세요.');
     const week = sunday(date);
-    const rows = (await db.prepare(`${bookingSelect} WHERE b.date>=? AND b.date<? ORDER BY b.date,b.start_min`).all(week, addDays(week, 7)));
-    return send(res, 200, { bookings: await Promise.all(rows.map(async row => (await bookingView(row, member)))), week, settings: (await getSettings(db)), usage: (await usageFor(member.id, week)) });
+    const [rows, settings, usage] = await Promise.all([
+      db.prepare(`${bookingSelect} WHERE b.date>=? AND b.date<? ORDER BY b.date,b.start_min`).all(week, addDays(week, 7)),
+      getSettings(db), usageFor(member.id, week),
+    ]);
+    const context = {now:seoulNow(), settings, teamIds:new Set(usage.teams.map(t=>t.teamId))};
+    return send(res, 200, { bookings: await Promise.all(rows.map(row => bookingView(row, member, context))), week, settings, usage });
   }
   if (path === '/api/bookings' && method === 'POST') return send(res, 201, (await createBooking(await jsonBody(req), member)));
+  const seriesMatch = path.match(/^\/api\/bookings\/(\d+)\/series$/);
+  if (seriesMatch && ['GET', 'DELETE'].includes(method)) {
+    const loadSeries = async viewer => {
+      const selected = await db.prepare('SELECT series_id,type FROM bookings WHERE id=?').get(Number(seriesMatch[1]));
+      if (!selected) fail(404, '예약을 찾을 수 없습니다.');
+      if (selected.type !== 'team' || !selected.series_id) fail(400, '반복으로 등록된 팀 합주만 전체 취소할 수 있습니다.');
+      const rows = await db.prepare(`${bookingSelect} WHERE b.series_id=? ORDER BY b.date,b.start_min,b.id`).all(selected.series_id);
+      const [settings, memberships] = await Promise.all([getSettings(db), db.prepare('SELECT team_id FROM team_members WHERE member_id=?').all(viewer.id)]);
+      const context = {now:seoulNow(), settings, teamIds:new Set(memberships.map(t=>t.team_id))};
+      const bookings = await Promise.all(rows.map(row => bookingView(row, viewer, context)));
+      return { seriesId: selected.series_id, bookings, count: bookings.length, canCancelAll: bookings.every(b => b.canCancel) };
+    };
+    if (method === 'GET') return send(res, 200, await loadSeries(member));
+    const count = await transaction(async () => {
+      const current = await requireMember(req);
+      const series = await loadSeries(current.member);
+      if (!series.canCancelAll) fail(403, '전체 예약 중 취소할 수 없는 날짜가 있습니다. 지난 예약·당일 취소 제한 또는 소속 팀을 확인하고 운영진에게 문의해 주세요.');
+      const deleted = await db.prepare('DELETE FROM bookings WHERE series_id=?').run(series.seriesId);
+      await audit(db, current.member.id, 'booking.cancel_series', { seriesId: series.seriesId, bookingIds: series.bookings.map(b => b.id), count: deleted.changes });
+      return deleted.changes;
+    });
+    return send(res, 200, { ok: true, count });
+  }
   const bookingMatch = path.match(/^\/api\/bookings\/(\d+)$/);
   if (bookingMatch && method === 'DELETE') {
     await transaction(async () => {
@@ -372,7 +416,10 @@ async function api(req, res, url) {
     if (kind && !['notice', 'wiki'].includes(kind)) fail(400, '게시물 종류를 확인해 주세요.');
     const rows = kind ? (await db.prepare(`${postSelect} WHERE p.kind=? ORDER BY p.pinned DESC,p.updated_at DESC,p.id DESC`).all(kind))
       : (await db.prepare(`${postSelect} ORDER BY p.pinned DESC,p.updated_at DESC,p.id DESC`).all());
-    return send(res, 200, { posts: await Promise.all(rows.map(postView)) });
+    const attachments = await db.prepare(`SELECT a.id,a.post_id,a.name,length(a.content) AS size FROM attachments a JOIN posts p ON p.id=a.post_id${kind?' WHERE p.kind=?':''}`).all(...(kind?[kind]:[]));
+    const byPost = new Map();
+    for (const {post_id,...attachment} of attachments) { if (!byPost.has(post_id)) byPost.set(post_id,[]); byPost.get(post_id).push(attachment); }
+    return send(res, 200, { posts: await Promise.all(rows.map(row=>postView(row,byPost.get(row.id)||[]))) });
   }
   const postMatch = path.match(/^\/api\/posts\/(\d+)$/);
   if ((path === '/api/posts' && method === 'POST') || (postMatch && method === 'PUT')) {
