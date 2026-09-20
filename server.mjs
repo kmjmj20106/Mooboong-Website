@@ -10,6 +10,7 @@ import { hashPassword, verifyPassword, randomToken, tokenHash, readCookies } fro
 import { previewImport, applyImport } from './lib/import.mjs';
 
 import { connectDatabase } from './lib/database.mjs';
+import { memberView, listMembers, listTeams } from './lib/member-views.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const publicRoot = resolve(root, 'public');
@@ -60,27 +61,17 @@ async function transaction(work) { return (await db.transaction(work)); }
 
 async function safeMember(member) {
   if (!member) return null;
-  return {
-    id: member.id, name: member.name, session: member.session, generation: member.generation,
-    phone: member.phone, admin: Boolean(member.admin), mustChangePassword: Boolean(member.must_change_password),
-    teams: (await db.prepare(`SELECT t.id,t.name,tm.slot FROM teams t JOIN team_members tm ON tm.team_id=t.id
-      WHERE tm.member_id=? ORDER BY t.name,tm.slot`).all(member.id)).filter((t,i,a)=>a.findIndex(x=>x.id===t.id)===i).sort((a,b)=>a.name.localeCompare(b.name,'ko',{numeric:true})),
-  };
+  const teams = await db.prepare(`SELECT t.id,t.name,tm.slot FROM teams t JOIN team_members tm ON tm.team_id=t.id
+    WHERE tm.member_id=? ORDER BY t.name,tm.slot`).all(member.id);
+  return memberView(member, teams);
 }
-async function teamList() {
-  return (await Promise.all((await db.prepare('SELECT id,name FROM teams ORDER BY name').all()).map(async team => {
-    const members = (await db.prepare(`SELECT m.id,m.name,tm.slot FROM team_members tm
-      JOIN members m ON m.id=tm.member_id WHERE tm.team_id=? ORDER BY tm.slot`).all(team.id));
-    return { ...team, slots: Object.fromEntries(slotNames.map(slot => [slot, members.find(member => member.slot === slot)?.id || ''])), members };
-  }))).sort((a,b)=>a.name.localeCompare(b.name,'ko',{numeric:true}));
-}
+async function teamList() { return listTeams(db); }
 async function sessionFrom(req) {
   const raw = readCookies(req.headers.cookie).mooboong_session;
   if (!raw || !/^[A-Za-z0-9_-]{43}$/.test(raw)) return null;
   const hash = tokenHash(raw);
-  const session = (await db.prepare('SELECT * FROM sessions WHERE token_hash=? AND expires_at>?').get(hash, Date.now()));
-  if (!session) return null;
-  const member = (await db.prepare('SELECT * FROM members WHERE id=?').get(session.member_id));
+  const member = await db.prepare(`SELECT m.* FROM sessions s JOIN members m ON m.id=s.member_id
+    WHERE s.token_hash=? AND s.expires_at>?`).get(hash, Date.now());
   return member ? { hash, member } : null;
 }
 async function requireMember(req, { admin = false, allowPasswordChange = false } = {}) {
@@ -100,9 +91,15 @@ async function createSession(res, memberId) {
 }
 function clearSession(res) { res.setHeader('Set-Cookie', 'mooboong_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' + secureCookie); }
 function removeUploads(hash) { for (const [token, upload] of uploads) if (upload.session === hash) uploads.delete(token); }
+let nextSessionCleanup = 0;
 async function cleanExpired() {
   const now = Date.now();
-  (await db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(now));
+  // Expiry is still enforced on every authentication; physical cleanup is periodic.
+  if (now >= nextSessionCleanup) {
+    nextSessionCleanup = now + 5 * 60 * 1000;
+    try { await db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(now); }
+    catch (error) { nextSessionCleanup = 0; throw error; }
+  }
   for (const [key, value] of attempts) if (value.until < now) attempts.delete(key);
   for (const [token, upload] of uploads) if (upload.expires < now) uploads.delete(token);
 }
@@ -324,8 +321,8 @@ async function api(req, res, url) {
   const member = session.member;
   if(await contentRoutes(req,res,url,db,member,{readBody,send,fail,transaction}))return;
   if (path === '/api/members' && method === 'GET') {
-    (await requireMember(req, { admin: true }));
-    return send(res, 200, { members: await Promise.all((await db.prepare('SELECT * FROM members ORDER BY name,id').all()).map(safeMember)) });
+    if (!member.admin) fail(403, '운영진만 사용할 수 있습니다.');
+    return send(res, 200, { members: await listMembers(db) });
   }
   if (path === '/api/members/password-reset' && method === 'POST') {
     const operator = await requireMember(req, { admin: true });
