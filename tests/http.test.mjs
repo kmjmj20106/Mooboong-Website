@@ -85,8 +85,8 @@ test('real HTTP: setup, XLSX import, access control, booking rules and persisten
       });
       const setCookie = response.headers.get('set-cookie');
       if (setCookie) cookie = setCookie.split(';')[0];
-      const bodyText = await response.text();
-      return { status: response.status, body: response.headers.get('content-type')?.includes('application/json') ? JSON.parse(bodyText) : bodyText, headers: response.headers };
+      const bytes = Buffer.from(await response.arrayBuffer());
+      return { status: response.status, body: response.headers.get('content-type')?.includes('application/json') ? JSON.parse(bytes.toString()) : bytes.toString(), bytes, headers: response.headers };
     };
   }
   const admin = client(), member = client(), guest = client();
@@ -123,6 +123,24 @@ test('real HTTP: setup, XLSX import, access control, booking rules and persisten
     assert.equal((await member('/api/teams')).body.code, 'PASSWORD_CHANGE_REQUIRED');
     assert.equal((await member('/api/password', 'POST', { currentPassword: '20000000', newPassword: 'MemberPassword123!' })).status, 200);
     assert.equal((await member('/api/members')).status, 403);
+    assert.equal((await guest('/api/members/export')).status, 401);
+    assert.equal((await member('/api/members/export')).status, 403);
+    const exported = await admin('/api/members/export?sort=name&order=desc');
+    assert.equal(exported.status, 200);
+    assert.match(exported.headers.get('content-type'), /spreadsheetml/);
+    assert.equal(exported.headers.get('cache-control'), 'no-store');
+    assert.match(exported.headers.get('content-disposition'), /attachment; filename="mooboong-members-.*\.xlsx"/);
+    const exportedRows = JSON.parse(execFileSync(python, ['lib/read_xlsx.py', '-'], { cwd: root, input: exported.bytes }).toString());
+    assert.equal(exportedRows.members.length, 2);
+    assert.ok(exportedRows.members.every(m => m['비밀번호'] === ''));
+    assert.equal(exportedRows.members.find(m => m['아이디'] === 'test-user')['전화번호'], '01000000000');
+    assert.equal(exportedRows.members.find(m => m['아이디'] === 'test-user')['팀'], 'HTTP 테스트');
+    assert.equal(exportedRows.teams.find(t => t['팀명'] === 'HTTP 테스트')['드럼'], 'admin');
+    const roundtrip = await admin('/api/import/file', 'POST', exported.bytes);
+    assert.equal(roundtrip.body.preview.valid, true, JSON.stringify(roundtrip.body));
+    assert.equal(roundtrip.body.preview.summary.newMembers, 0);
+    assert.equal((await admin('/api/import/commit', 'POST', { token: roundtrip.body.token })).body.applied, true);
+    assert.equal((await member('/api/me')).status, 200, 'export and reimport do not reset passwords or sessions');
     assert.equal((await member('/api/posts', 'POST', { kind: 'wiki', title: '권한', body: '권한' })).status, 403);
 
     const date = new Date(Date.now() + 36 * 3600000).toISOString().slice(0, 10);
@@ -165,6 +183,74 @@ test('real HTTP: setup, XLSX import, access control, booking rules and persisten
     await admin('/api/settings','PUT',{recurringUntil:day(14)});
     assert.equal((await member('/api/bookings','POST',{date:repeatDate,start:'13:00',end:'14:00',type:'team',teamId,repeatUntil:repeatEnd})).status,400);
     await admin('/api/settings','PUT',{recurringUntil:''});
+
+    // Series cancellation is scoped to one repeat group and remains atomic.
+    const seriesPath=id=>`/api/bookings/${id}/series`;
+    const sameTeamOtherSeries=await member('/api/bookings','POST',{date:repeatDate,start:'10:00',end:'10:30',type:'team',teamId,repeatUntil:repeatEnd});
+    assert.equal(sameTeamOtherSeries.status,201,JSON.stringify(sameTeamOtherSeries.body));
+    assert.notEqual(sameTeamOtherSeries.body.booking.seriesId,recurring.body.booking.seriesId);
+    assert.equal((await guest(seriesPath(recurring.body.booking.id),'DELETE')).status,401);
+    assert.equal((await member(`/api/bookings/${recurring.body.booking.id}`,'DELETE')).status,200);
+    const remainingId=recurring.body.bookings[1].id;
+    const preview=await member(seriesPath(remainingId));
+    assert.equal(preview.body.count,2);assert.equal(preview.body.canCancelAll,true);
+    assert.equal((await member(seriesPath(remainingId),'DELETE',undefined,{Origin:'https://other.invalid'})).status,403);
+    const cancelled=await member(seriesPath(remainingId),'DELETE');
+    assert.equal(cancelled.status,200);assert.equal(cancelled.body.count,2);
+    assert.equal((await member(seriesPath(sameTeamOtherSeries.body.booking.id))).body.count,3,'another repeat group for same team survives');
+    assert.equal((await member(seriesPath(remainingId),'DELETE')).status,404);
+
+    // A blocked occurrence cannot be bypassed by choosing another future occurrence.
+    const past=new Date(Date.now()-48*3600000).toISOString().slice(0,10);
+    const setBookingDate=async(id,dateValue)=>{
+      if(testDatabase){
+        const {Client}=await import('pg');const fixtureDb=new Client({connectionString:testDatabase});await fixtureDb.connect();
+        try{await fixtureDb.query('UPDATE mooboong.bookings SET date=$1 WHERE id=$2',[dateValue,id])}finally{await fixtureDb.end()}
+      }else{
+        const fixtureDb=new DatabaseSync(join(dataDirectory,'mooboong.sqlite'));
+        try{fixtureDb.prepare('UPDATE bookings SET date=? WHERE id=?').run(dateValue,id)}finally{fixtureDb.close()}
+      }
+    };
+    await setBookingDate(sameTeamOtherSeries.body.booking.id,past);
+    const futureAnchor=sameTeamOtherSeries.body.bookings[1].id;
+    assert.equal((await member(seriesPath(futureAnchor))).body.canCancelAll,false);
+    assert.equal((await member(seriesPath(futureAnchor),'DELETE')).status,403);
+    assert.equal((await admin(seriesPath(futureAnchor))).body.count,3,'failed batch changes nothing');
+    const policyToday=new Date(Date.now()+9*3600000).toISOString().slice(0,10);
+    await setBookingDate(sameTeamOtherSeries.body.booking.id,policyToday);
+    await admin('/api/settings','PUT',{blockSameDayCancellation:true});
+    assert.equal((await member(seriesPath(futureAnchor),'DELETE')).status,403);
+    assert.equal((await admin(seriesPath(futureAnchor))).body.count,3);
+    assert.equal((await admin(seriesPath(futureAnchor),'DELETE')).body.count,3);
+    await admin('/api/settings','PUT',{blockSameDayCancellation:false});
+
+    // Administrators can book any team, including a completely vacant team.
+    const otherTeamSeries=await admin('/api/bookings','POST',{date:repeatDate,start:'18:00',end:'19:00',type:'team',teamId:otherTeamId,repeatUntil:repeatEnd});
+    assert.equal(otherTeamSeries.status,201,JSON.stringify(otherTeamSeries.body));
+    assert.equal(otherTeamSeries.body.count,3);
+    assert.ok(otherTeamSeries.body.bookings.every(b=>b.createdBy==='admin')); 
+    assert.equal((await member(seriesPath(otherTeamSeries.body.booking.id),'DELETE')).status,403);
+    assert.equal((await admin(seriesPath(otherTeamSeries.body.booking.id),'DELETE')).body.count,3);
+
+    // Personal proxy reservations belong to the selected account and consume its quota.
+    assert.equal((await member('/api/booking-options')).status,403);
+    const choices=(await admin('/api/booking-options')).body.members;
+    assert.deepEqual(Object.keys(choices[0]).sort(),['id','name']);
+    assert.equal(choices.length,2);
+    const proxyBody={date:repeatDate,start:'14:00',end:'16:00',type:'personal',memberId:'test-user'};
+    assert.equal((await member('/api/bookings','POST',{...proxyBody,memberId:'admin'})).status,403);
+    assert.equal((await admin('/api/bookings','POST',{...proxyBody,memberId:'not-found'})).status,400);
+    const proxy=await admin('/api/bookings','POST',proxyBody);
+    assert.equal(proxy.status,201,JSON.stringify(proxy.body));
+    assert.equal(proxy.body.booking.memberId,'test-user');
+    assert.equal(proxy.body.booking.createdBy,'admin');
+    assert.equal(proxy.body.booking.createdByName,'테스트 운영진');
+    assert.equal((await member(`/api/bookings?week=${repeatDate}`)).body.bookings.find(b=>b.id===proxy.body.booking.id).createdBy,'admin');
+    assert.equal((await member(`/api/bookings?week=${repeatDate}`)).body.usage.personalHours,2);
+    assert.equal((await admin('/api/bookings','POST',{...proxyBody,start:'17:00',end:'19:00'})).status,400,'target account weekly quota applies');
+    assert.equal((await admin('/api/bookings','POST',{...proxyBody,memberId:'admin'})).status,409,'admin proxy still checks room conflicts');
+    assert.equal((await admin(seriesPath(proxy.body.booking.id),'DELETE')).status,400,'single reservation is not a series');
+    assert.equal((await member(`/api/bookings/${proxy.body.booking.id}`,'DELETE')).status,200,'target owns proxy booking');
 
     // Existing same-day bookings are covered when an operator changes the policy.
     const now=new Date(Date.now()+9*3600000), today=now.toISOString().slice(0,10);
@@ -209,10 +295,55 @@ test('real HTTP: setup, XLSX import, access control, booking rules and persisten
     assert.equal((await guest(`/api/posts/${imported.body.id}/document`)).status,401);
     assert.equal((await admin('/api/posts','POST',{kind:'wiki',title:'bad URL',body:'test',sourceUrl:'javascript:alert(1)'})).status,400);
 
+    // Custom schedules share the booking lock, block the room, and never use quotas.
+    const eventBody = { title: '대청소 <안내>', description: '장갑을 준비해 주세요.', date: day(26), start: '08:00', end: '24:00' };
+    assert.equal((await guest('/api/events', 'POST', eventBody)).status, 401);
+    assert.equal((await member('/api/events', 'POST', eventBody)).status, 403);
+    assert.equal((await admin('/api/events', 'POST', eventBody, { Origin: 'https://other.invalid' })).status, 403);
+    for (const patch of [{ title: '' }, { title: 'x'.repeat(101) }, { date: '2026-02-30' }, { start: '07:30' }, { end: '08:00' }, { start: '08:15' }, { date: day(-5) }, { date: day(400) }]) {
+      assert.equal((await admin('/api/events', 'POST', {...eventBody,...patch})).status, 400);
+    }
+    assert.equal((await admin('/api/events', 'POST', {...eventBody,date,start:'13:00',end:'14:00'})).status, 409, 'events cannot replace existing bookings');
+    const usageBeforeEvent = (await admin('/api/bookings?week='+eventBody.date)).body.usage;
+    const event = await admin('/api/events', 'POST', eventBody);
+    assert.equal(event.status, 201, JSON.stringify(event.body));
+    const eventId = event.body.event.eventId, eventPath = '/api/events/'+eventId;
+    assert.equal(event.body.event.id, 'event-'+eventId);
+    assert.equal(event.body.event.createdByName, '테스트 운영진');
+    const memberSchedule = (await member('/api/bookings?week='+eventBody.date)).body.bookings;
+    assert.equal(memberSchedule.find(x=>x.id===event.body.event.id).canCancel, false);
+    assert.equal((await admin('/api/events','POST',eventBody)).status,409);
+    assert.equal((await member(eventPath,'PUT',eventBody)).status,403);
+    assert.equal((await member(eventPath,'DELETE')).status,403);
+    assert.equal((await admin('/api/bookings','POST',{date:eventBody.date,start:'10:00',end:'11:00',type:'personal'})).status,409);
+    assert.deepEqual((await admin('/api/bookings?week='+eventBody.date)).body.usage,usageBeforeEvent);
+    const beforeSeries = (await admin('/api/bookings?week='+day(19))).body.bookings;
+    const blockedSeries=await admin('/api/bookings','POST',{date:day(19),start:'08:00',end:'08:30',type:'team',teamId,repeatUntil:day(26)});
+    assert.equal(blockedSeries.status,409);
+    assert.deepEqual((await admin('/api/bookings?week='+day(19))).body.bookings,beforeSeries,'a late event collision rolls back the entire series');
+    assert.equal((await admin(eventPath,'PUT',{...eventBody,date,start:'13:00',end:'14:00'})).status,409);
+    assert.equal((await member('/api/bookings?week='+eventBody.date)).body.bookings.find(x=>x.eventId===eventId).start,'08:00','failed update preserves the event');
+    assert.equal((await admin(eventPath,'PUT',{...eventBody,title:'면접',start:'18:00',end:'20:00'})).status,200);
+    const adjacentEvent=await admin('/api/events','POST',{...eventBody,title:'면접 준비',start:'17:00',end:'18:00'});
+    assert.equal(adjacentEvent.status,201);
+    assert.equal((await admin('/api/events/'+adjacentEvent.body.event.eventId,'DELETE')).status,200);
+    assert.equal((await admin('/api/events/'+adjacentEvent.body.event.eventId,'DELETE')).status,404);
+    const freed=await admin('/api/bookings','POST',{date:eventBody.date,start:'17:00',end:'18:00',type:'personal'});
+    assert.equal(freed.status,201,'deleting an event makes its time bookable');
+    await admin('/api/bookings/'+freed.body.booking.id,'DELETE');
+    const competingEvent = await Promise.all([
+      admin('/api/events','POST',{...eventBody,start:'10:00',end:'11:00'}),
+      admin('/api/bookings','POST',{date:eventBody.date,start:'10:00',end:'11:00',type:'personal'}),
+    ]);
+    assert.deepEqual(competingEvent.map(x=>x.status).sort(),[201,409],'event and booking cannot race into the same slot');
+    if(competingEvent[0].status===201)await admin('/api/events/'+competingEvent[0].body.event.eventId,'DELETE');
+    else await admin('/api/bookings/'+competingEvent[1].body.booking.id,'DELETE');
+
     await stop();
     if(testDatabase) await rm(dataDirectory,{recursive:true,force:true}); // Model Render discarding its disk.
     await start();
     assert.equal((await guest('/api/status')).body.setupRequired, false);
+    assert.equal((await admin('/api/bookings?week='+eventBody.date)).body.bookings.find(x=>x.eventId===eventId).title,'면접','custom events persist across server restarts');
     assert.equal((await admin('/api/posts?kind=notice')).body.posts[0].id, post.body.post.id);
     assert.equal((await admin('/api/posts?kind=notice')).body.posts[0].title, 'HTTP 저장 테스트');
     assert.equal((await member(`/api/bookings?week=${date}`)).body.bookings.length, 2);
@@ -254,6 +385,11 @@ test('real HTTP: setup, XLSX import, access control, booking rules and persisten
     assert.equal((await member('/api/password','POST',{currentPassword:'AdminTemporary123!',newPassword:'FinalMemberPassword456!'})).status,200);
     assert.equal((await member('/api/logout', 'POST', {})).status, 200);
     assert.equal((await member('/api/me')).status, 401);
+    const adminLogout=await admin('/api/logout','POST',{});
+    assert.equal(adminLogout.status,200);
+    assert.match(adminLogout.headers.get('set-cookie'),/Max-Age=0/);
+    assert.equal((await admin('/api/me')).status,401);
+    assert.equal((await admin('/api/members')).status,401);
   } finally {
     await stop();
     await rm(dataDirectory, { recursive: true, force: true });

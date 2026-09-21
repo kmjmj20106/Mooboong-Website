@@ -11,6 +11,7 @@ import { previewImport, applyImport } from './lib/import.mjs';
 
 import { connectDatabase } from './lib/database.mjs';
 import { memberView, listMembers, listTeams } from './lib/member-views.mjs';
+import { exportMembers } from './lib/member-export.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const publicRoot = resolve(root, 'public');
@@ -156,6 +157,31 @@ async function bookingView(row, member, context = null) {
 const bookingSelect = `SELECT b.*,m.name AS member_name,t.name AS team_name,creator.name AS creator_name FROM bookings b
   JOIN members m ON m.id=b.member_id LEFT JOIN teams t ON t.id=b.team_id
   LEFT JOIN members creator ON creator.id=COALESCE(b.created_by,b.member_id)`;
+const eventSelect = `SELECT e.*,m.name AS creator_name FROM events e JOIN members m ON m.id=e.created_by`;
+function eventView(row, member) {
+  return { id: `event-${row.id}`, eventId: row.id, type: 'event', title: row.title, description: row.description,
+    date: row.date, start: toTime(row.start_min), end: toTime(row.end_min),
+    createdBy: row.created_by, createdByName: row.creator_name, canCancel: Boolean(member.admin), canEdit: Boolean(member.admin) };
+}
+async function saveEvent(body, actor, id = null) {
+  if (typeof body.title !== 'string' || !body.title.trim() || body.title.length > 100) fail(400, '일정 제목은 1~100자로 입력해 주세요.');
+  if (body.description !== undefined && (typeof body.description !== 'string' || body.description.length > 2000)) fail(400, '일정 설명은 2,000자 이내로 입력해 주세요.');
+  if (!validDate(body.date)) fail(400, '일정 날짜를 확인해 주세요.');
+  if (body.repeatUntil) fail(400, '커스텀 일정은 날짜별로 등록해 주세요.');
+  const start = minutes(body.start), end = minutes(body.end), now = seoulNow();
+  if (start < 480 || end > 1440 || end <= start) fail(400, '일정은 08:00부터 24:00 사이에 등록할 수 있습니다.');
+  if (body.date < now.date || (body.date === now.date && start <= now.minute)) fail(400, '이미 지난 시간에는 일정을 등록할 수 없습니다.');
+  if (body.date > addDays(now.date, 366)) fail(400, '커스텀 일정은 최대 1년 뒤까지 등록할 수 있습니다.');
+  if (id !== null && !await db.prepare('SELECT id FROM events WHERE id=?').get(id)) fail(404, '일정을 찾을 수 없습니다.');
+  if (await db.prepare('SELECT id FROM bookings WHERE date=? AND start_min<? AND end_min>?').get(body.date, end, start)) fail(409, '기존 예약과 시간이 겹칩니다. 예약을 확인한 뒤 빈 시간에 등록해 주세요.');
+  if (await db.prepare('SELECT id FROM events WHERE date=? AND start_min<? AND end_min>? AND id<>?').get(body.date, end, start, id ?? -1)) fail(409, '다른 커스텀 일정과 시간이 겹칩니다.');
+  const values = [body.title.trim(), (body.description || '').trim(), body.date, start, end];
+  const editing = id !== null;
+  if (editing) await db.prepare('UPDATE events SET title=?,description=?,date=?,start_min=?,end_min=? WHERE id=?').run(...values, id);
+  else id = Number((await db.prepare('INSERT INTO events(title,description,date,start_min,end_min,created_by) VALUES (?,?,?,?,?,?)').run(...values, actor.id)).lastInsertRowid);
+  await audit(db, actor.id, editing ? 'event.update' : 'event.create', { eventId: id });
+  return eventView(await db.prepare(`${eventSelect} WHERE e.id=?`).get(id), actor);
+}
 async function getBooking(id, member) { const row = (await db.prepare(`${bookingSelect} WHERE b.id=?`).get(id)); return row ? (await bookingView(row, member)) : null; }
 async function usageFor(memberId, week) {
   const until = addDays(week, 7);
@@ -186,6 +212,7 @@ async function createOneBooking(body, member, seriesId = null, recurring = false
       if (!member.admin && !(await db.prepare('SELECT 1 FROM team_members WHERE team_id=? AND member_id=?').get(teamId, member.id))) fail(403, '소속 팀의 합주만 예약할 수 있습니다.');
     }
     if ((await db.prepare('SELECT id FROM bookings WHERE date=? AND start_min<? AND end_min>?').get(date, end, start))) fail(409, '다른 예약과 시간이 겹칩니다. 빈 시간을 다시 선택해 주세요.');
+    if (await db.prepare('SELECT id FROM events WHERE date=? AND start_min<? AND end_min>?').get(date, end, start)) fail(409, '커스텀 일정이 있는 시간입니다. 다른 시간을 선택해 주세요.');
     const ownerColumn = type === 'team' ? 'team_id' : 'member_id';
     const owner = teamId ?? ownerMember.id;
     const week = sunday(date);
@@ -337,6 +364,16 @@ async function api(req, res, url) {
     if (!member.admin) fail(403, '운영진만 사용할 수 있습니다.');
     return send(res, 200, { members: await listMembers(db) });
   }
+  if (path === '/api/members/export' && method === 'GET') {
+    if (!member.admin) fail(403, '운영진만 사용할 수 있습니다.');
+    const workbook = await exportMembers(db, url.searchParams.get('sort'), url.searchParams.get('order'));
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="mooboong-members-${seoulNow().date}.xlsx"`,
+      'Content-Length': workbook.length, 'Cache-Control': 'no-store',
+    });
+    return res.end(workbook);
+  }
   if (path === '/api/members/password-reset' && method === 'POST') {
     const operator = await requireMember(req, { admin: true });
     const body = await jsonBody(req);
@@ -369,12 +406,32 @@ async function api(req, res, url) {
     const date = url.searchParams.get('week') || seoulNow().date;
     if (!validDate(date)) fail(400, '날짜를 확인해 주세요.');
     const week = sunday(date);
-    const [rows, settings, usage] = await Promise.all([
+    const [rows, settings, usage, events] = await Promise.all([
       db.prepare(`${bookingSelect} WHERE b.date>=? AND b.date<? ORDER BY b.date,b.start_min`).all(week, addDays(week, 7)),
       getSettings(db), usageFor(member.id, week),
+      db.prepare(`${eventSelect} WHERE e.date>=? AND e.date<? ORDER BY e.date,e.start_min`).all(week, addDays(week, 7)),
     ]);
     const context = {now:seoulNow(), settings, teamIds:new Set(usage.teams.map(t=>t.teamId))};
-    return send(res, 200, { bookings: await Promise.all(rows.map(row => bookingView(row, member, context))), week, settings, usage });
+    const bookings = [...await Promise.all(rows.map(row => bookingView(row, member, context))), ...events.map(row => eventView(row, member))];
+    bookings.sort((a,b) => a.date.localeCompare(b.date) || a.start.localeCompare(b.start));
+    return send(res, 200, { bookings, week, settings, usage });
+  }
+  const eventMatch = path.match(/^\/api\/events\/(\d+)$/);
+  if ((path === '/api/events' && method === 'POST') || (eventMatch && ['PUT', 'DELETE'].includes(method))) {
+    if (!member.admin) fail(403, '운영진만 커스텀 일정을 관리할 수 있습니다.');
+    const body = method === 'DELETE' ? null : await jsonBody(req);
+    const result = await transaction(async () => {
+      // Recheck privileges while holding the same lock used by booking creation.
+      const current = await requireMember(req, { admin: true });
+      const id = eventMatch ? Number(eventMatch[1]) : null;
+      if (method === 'DELETE') {
+        if (!(await db.prepare('DELETE FROM events WHERE id=?').run(id)).changes) fail(404, '일정을 찾을 수 없습니다.');
+        await audit(db, current.member.id, 'event.delete', { eventId: id });
+        return { ok: true };
+      }
+      return { event: await saveEvent(body, current.member, id) };
+    });
+    return send(res, method === 'POST' ? 201 : 200, result);
   }
   if (path === '/api/bookings' && method === 'POST') return send(res, 201, (await createBooking(await jsonBody(req), member)));
   const seriesMatch = path.match(/^\/api\/bookings\/(\d+)\/series$/);

@@ -20,6 +20,7 @@
 .password-actions{display:flex;align-items:center;gap:8px;white-space:nowrap}.password-tools{display:flex;flex-wrap:wrap;gap:8px;margin:-6px 0 24px}.password-help{line-height:1.8;margin:14px 0 24px;color:var(--muted,#777)}
 
 .series-cancel-list{max-height:240px;overflow:auto;margin:16px 0;padding:8px 16px;background:#f6f6f6;border-radius:12px}.series-cancel-list li{padding:5px 0}
+.booking-block.event{background:#fff0db;border-left-color:#c58b3f;color:#775020}.legend i.event{background:#c58b3f}.tag.event{background:#fff0db;color:#775020}.event-heading h3{font-size:22px;margin:14px 0;overflow-wrap:anywhere}.event-description{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.8;padding:16px;background:#f6f7fa;border-radius:8px}.event-description a{color:#4f60ac;text-decoration:underline}.event-help{font-size:13px;color:var(--muted);margin-top:16px}
 
 .top-logout{white-space:nowrap;flex-shrink:0}.route-sync{position:fixed;right:22px;top:82px;z-index:35;padding:6px 10px;background:#eeeff8;border-radius:20px;color:#575b76;font-size:11px}.route-sync[hidden]{display:none}.booking-block .booking-creator{font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}.booking-block{overflow:hidden}.modal-actions{flex-wrap:wrap}
 @media(max-width:600px){.top-meta .tag{display:none}.top-logout{font-size:11px;padding:6px 8px}.top-logout svg{display:none}.route-sync{top:68px;right:12px}.calendar:not(.zoom) .booking-block .booking-creator{display:block;font-size:8px;line-height:11px}.preview-grid .booking-creator{font-size:8px}}

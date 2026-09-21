@@ -51,6 +51,8 @@ test('PostgreSQL protocol: PGlite HTTP suite, empty-disk restart and transaction
     assert.equal(exported.code,0,exported.output);
     const original=JSON.parse(await readFile(backupFile,'utf8'));
     assert.equal(original.data.members.length,2);
+    assert.equal(original.data.events.length,1);
+    assert.equal(original.data.events[0].title,'면접');
     assert.ok(original.data.attachments.length>0);
     assert.ok(original.data.attachments[0].content.base64);
     assert.ok(!JSON.stringify(original.data.audit_log).includes('TemporaryPassword123!'));
@@ -67,9 +69,18 @@ test('PostgreSQL protocol: PGlite HTTP suite, empty-disk restart and transaction
     for(const table of Object.keys(original.data))assert.deepEqual(restoredData[table],original.data[table],table);
     const next=await engine.query("INSERT INTO mooboong.teams(name) VALUES('복원 후 새 팀') RETURNING id");
     assert.ok(next.rows[0].id>Math.max(...original.data.teams.map(t=>t.id)));
+    // Older v1 backups contain no events field and remain supported.
+    const {writeFile}=await import('node:fs/promises');
+    const legacy=structuredClone(original);delete legacy.data.events;
+    const legacyFile=join(directory,'legacy.backup.json');
+    await writeFile(legacyFile,JSON.stringify(legacy));
+    await engine.exec('DROP SCHEMA mooboong CASCADE');
+    const legacyRestore=await runTransfer(['import',legacyFile]);
+    assert.equal(legacyRestore.code,0,legacyRestore.output);
+    assert.equal((await engine.query('SELECT COUNT(*) n FROM mooboong.events')).rows[0].n,0);
   } finally {
     if(started)await pg.stop();
-    await engine.close();
+    await new Promise(resolve=>setImmediate(resolve)); await engine.runExclusive(async()=>{}); await new Promise(resolve=>setImmediate(resolve)); await engine.close();
     await rm(directory,{recursive:true,force:true});
   }
 });

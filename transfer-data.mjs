@@ -3,8 +3,8 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { connectDatabase } from './lib/database.mjs';
 
-const tables = ['members','teams','team_members','bookings','posts','attachments','wiki_assets','settings','audit_log'];
-const identities = ['teams','bookings','posts','attachments','audit_log'];
+const tables = ['members','teams','team_members','bookings','events','posts','attachments','wiki_assets','settings','audit_log'];
+const identities = ['teams','bookings','events','posts','attachments','audit_log'];
 const [mode, filename, sqliteFile] = process.argv.slice(2);
 if (!['export','import'].includes(mode) || !filename) {
   console.error('내보내기: node transfer-data.mjs export 백업.json [기존SQLite파일]\n가져오기: node --env-file=.env transfer-data.mjs import 백업.json (빈 Supabase DB에만 가능)');
@@ -21,6 +21,8 @@ try {
     const backup=await db.transaction(async()=>{
       const data={};
       for(const table of tables){
+        // Legacy SQLite files predate custom events and must remain exportable.
+        if (sqliteFile && table === 'events' && !db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='events'").get()) { data.events = []; continue; }
         data[table]=(await db.prepare(`SELECT * FROM ${table}`).all()).map(row=>Object.fromEntries(Object.entries(row).map(([key,value])=>[key,value instanceof Uint8Array?{base64:Buffer.from(value).toString('base64')}:value])));
       }
       return {format:'mooboong-backup-v1',createdAt:new Date().toISOString(),data};
@@ -29,6 +31,8 @@ try {
     console.log('백업 저장 완료. 계정·전화번호·첨부파일이 포함되므로 비공개로 보관하세요.');
   }else{
     const backup=JSON.parse(await readFile(resolve(filename),'utf8'));
+    // v1 backups created before custom schedules have no events collection.
+    if (backup.data && backup.data.events === undefined) backup.data.events = [];
     if(backup.format!=='mooboong-backup-v1'||!backup.data||!tables.every(t=>Array.isArray(backup.data[t])))throw new Error('무붕 백업 형식이 아닙니다.');
     db=await connectDatabase('');
     await db.transaction(async()=>{

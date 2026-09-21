@@ -48,5 +48,5 @@ test('production refuses missing DATABASE_URL and secures Render setup', {timeou
     assert.equal(response.status,201,await response.text());
     assert.match(response.headers.get('set-cookie'),/; Secure/);
     assert.match(response.headers.get('set-cookie'),/HttpOnly; SameSite=Strict/);
-  }finally{await stop(child);await socket.stop();await engine.close()}
+  }finally{await stop(child);await socket.stop();await new Promise(resolve=>setImmediate(resolve)); await engine.runExclusive(async()=>{}); await new Promise(resolve=>setImmediate(resolve)); await engine.close()}
 });
